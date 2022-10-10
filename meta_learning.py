@@ -8,11 +8,13 @@ import torch
 import copy
 from scipy import stats
 import shutil
-from metric_utils import load_cifar_model, get_dataset, load_tinyimagenet_model
+from metric_utils import load_cifar_model, get_dataset, load_tinyimagenet_model, load_imagenet_model
 from torchvision import datasets
 from matplotlib import pyplot as plt
 from PIL import Image
 import cv2
+from torchvision.transforms import functional as TF
+
 class MetaFinger():
     def __init__(self, dataset="cifar10", n_sample=3, alpha=1,  n_query = 100,
                  batch_size = 70,  trans=True, epoch=10, lr=0.01):
@@ -49,11 +51,16 @@ class MetaFinger():
             self.std = flags.cifar10_std
             self.trans_list += [RP2(size=(24, 40)), RandTranslate(tx=(0, 5), ty=(0, 5))]
             self.load_model = load_cifar_model
-        else:
+        elif self.dataset == "tinyimagenet":
             self.mean = flags.tinyimagenet_mean
             self.std = flags.tinyimagenet_std
             self.trans_list += [RP2(size=(56, 72)), RandTranslate(tx=(0, 10), ty=(0, 10))]
             self.load_model = load_tinyimagenet_model
+        else:
+            self.mean = flags.imagenet_mean
+            self.std = flags.imagenet_std
+            self.trans_list += [RP2(size=(208, 240)), RandTranslate(tx=(0, 10), ty=(0, 10))]
+            self.load_model = load_imagenet_model
 
     def model_forward(self, model_pth, inp):
         model = self.load_model(model_pth)
@@ -156,15 +163,27 @@ class MetaFinger():
 
             return inp, labels
         else:
-            #
-            trainset = datasets.ImageFolder(flags.tiny_imagenet_pth)
+            if self.dataset == "tinyimagenet":
+                trainset = datasets.ImageFolder(flags.tiny_imagenet_pth)
+            else:
+                trainset = datasets.ImageFolder(flags.imagenet12_path)
 
             idx = np.random.choice(np.arange(30000), size=(self.batch_size, ), replace=False)
 
             img_list, label_list = [], []
             for index in idx:
                 path, label = trainset.imgs[index]
-                img = np.array(cv2.imread(path))
+                img = Image.open(path)
+
+                if self.dataset == "imagenet":
+                    img = TF.resize(img, 224)
+                    img = TF.center_crop(img, 224)
+
+                img = np.array(img)
+
+                if img.shape != (224, 224, 3):
+                    continue
+
                 img = np.expand_dims(img, 0)
                 img_list.append(img)
                 label_list.append(label)
@@ -181,11 +200,10 @@ class MetaFinger():
     def gen_queryset(self):
         train_pos, train_neg = get_dataset(self.train_path)
         val_pos, val_neg = get_dataset(self.val_path)
-        test_pos, test_neg = get_dataset(self.test_path)
         final_queryset, final_lables = [],[]
         original_set, original_labels = [], []
 
-        for _ in range(10):
+        for _ in range(100):
 
             inp, o_labels = self.get_inp()
             original_inp = copy.deepcopy(inp.data)
@@ -208,17 +226,6 @@ class MetaFinger():
                 if neg_acc.mean() <= best_neg_acc and i > 4:
                     best_neg_acc = neg_acc.mean()
                     best_inp =inp.detach().clone()
-
-                # queryset, querylabels, mask = self.screen_queryset(inp.data, val_pos, val_neg)
-                # pos_acc, neg_acc, _ = self.epoch_eval(queryset, test_pos, test_neg, y=querylabels)
-                # print("[Test:] query length:{}, mean pos acc:{:.4f}, mean neg acc:{:.4f}".format(len(querylabels), pos_acc.mean(),neg_acc.mean()))
-                #
-                # if len(querylabels) > 10:
-                #     for i in range(8):
-                #         plt.subplot(2,4,i+1)
-                #         plt.imshow(to_plt_data(queryset[i]))
-                #     plt.show()
-                #     print()
 
                 torch.cuda.empty_cache()
 
@@ -277,71 +284,29 @@ def gen_tinyimagenet_queryset():
     pos, neg = metafinger.eval_queryset()
     print("pos :{}, neg:{}".format(pos, neg))
 
+def gen_imagenet_queryset():
 
-def ablation():
-    copy_dir = "weights/negative_models"
-    train_neg_dir = "weights/train_data/negative_models"
-    val_neg_dir = "weights/val_data/negative_models"
+    metafinger = MetaFinger(dataset="imagenet", n_sample=3, alpha=1, n_query=100,
+                            batch_size=10, trans=True, epoch=10, lr=0.04)
 
-    # copy_dir = "weights/train_data/other"
-    train_ratio, val_ratio = 2/3, 1/3
+    metafinger.gen_queryset()
+    pos, neg = metafinger.eval_queryset()
+    print("pos :{}, neg:{}".format(pos, neg))
 
-    def move_in(factor, base_model):
+import torch
+# fix random seed
+def same_seeds(seed):
+    torch.manual_seed(seed)  # 固定随机种子（CPU）
+    if torch.cuda.is_available():  # 固定随机种子（GPU)
+        torch.cuda.manual_seed(seed)  # 为当前GPU设置
+        torch.cuda.manual_seed_all(seed)  # 为所有GPU设置
+    np.random.seed(seed)  # 保证后续使用random函数时，产生固定的随机数
+    torch.backends.cudnn.benchmark = False  # GPU、网络结构固定，可设置为True
+    torch.backends.cudnn.deterministic = True  # 固定网络结构
 
-        train_num = int(train_ratio*base_model)
-        for i in range(base_model):
-            neg_dir = train_neg_dir if i < train_num else val_neg_dir
-
-            source_path = os.path.join(copy_dir, "{}.pth".format(i))
-            dst_path = os.path.join(neg_dir,  "{}.pth".format(i))
-
-            shutil.move(source_path, dst_path)
-            if factor == 0:
-                continue
-
-            for j in range(factor):
-                source_path = os.path.join(copy_dir, "{}_{}.pth".format(i, j))
-                dst_path = os.path.join(neg_dir, "{}_{}.pth".format(i, j))
-
-                shutil.move(source_path, dst_path)
-
-    def move_out():
-        def _out(neg_dir):
-            for file_name in os.listdir(neg_dir):
-                source_path = os.path.join(neg_dir, file_name)
-                dst_path = os.path.join(copy_dir, file_name)
-                shutil.move(source_path, dst_path)
-
-        _out(train_neg_dir)
-        _out(val_neg_dir)
-
-    with open("abaltion.txt", "w") as log_file:
-        for factor in [7]:
-            for base_model in [15]:
-
-                print("augmentation factor:{}, base model:{}".format(factor, base_model), file=log_file)
-                move_in(factor, base_model)
-
-                n_sample = 3
-                if factor == 0 and base_model == 3:
-                    n_sample = 1
-
-                metafinger = MetaFinger(dataset="cifar10", n_sample=n_sample, alpha=1, n_query=100,
-                                        batch_size=70, trans=True, epoch=10, lr=0.01)
-
-                metafinger.gen_queryset()
-                pos_acc, neg_acc = metafinger.eval_queryset()
-                print("[Test:] mean pos acc:{:.4f}, mean neg acc:{:.4f}".format(pos_acc, neg_acc), file=log_file)
-                log_file.flush()
-
-                move_out()
-
-
-
+same_seeds(0)
 if __name__ == '__main__':
-    gen_cifar_queryset()
-    gen_tinyimagenet_queryset()
+    # gen_cifar_queryset()
+    # gen_tinyimagenet_queryset()
+    gen_imagenet_queryset()
     # eval_queryset()
-    # lr=1e-2 may yield better results
-    # optimizer = torch.optim.SGD([inp], lr=1e-2, momentum=0.9, nesterov=True)
-
